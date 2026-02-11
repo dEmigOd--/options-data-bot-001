@@ -32,13 +32,13 @@ def _ensure_database_exists() -> None:
     db_name = _safe_database_name(db_name)
     master_conn_str = _connection_string_to_master(SQL_CONNECTION_STRING)
     conn = pyodbc.connect(master_conn_str)
+    conn.autocommit = True  # CREATE DATABASE not allowed inside a transaction
     try:
         cursor = conn.cursor()
         cursor.execute(
             "IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = ?) CREATE DATABASE [" + db_name + "]",
             (db_name,),
         )
-        conn.commit()
         logger.info("Database %r created or already exists.", db_name)
     finally:
         conn.close()
