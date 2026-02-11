@@ -1,11 +1,35 @@
 """Interactive Brokers options chain supplier (read-only, with security logging)."""
 
 import logging
+import math
 from datetime import date, datetime, timezone
 from typing import List
 
 from ib_insync import IB, Index, Option, util
 from ib_insync.ib import OptionChain
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    """Coerce to float valid for SQL; replace NaN/inf/None/-1 with default."""
+    if v is None or v == -1:
+        return default
+    try:
+        f = float(v)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(v, default: int = 0) -> int:
+    """Coerce to int valid for DB; None/NaN -> default."""
+    if v is None:
+        return default
+    try:
+        if math.isnan(float(v)):
+            return default
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
 
 from spx_options.config import IBKR_HOST, IBKR_PORT, SPX_SYMBOL
 from spx_options.security_log import log_ibkr_access
@@ -119,18 +143,24 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         out: List[OptionQuote] = []
         for t in tickers:
             c = t.contract
-            bid = float(t.bid) if t.bid is not None and t.bid != -1 else 0.0
-            ask = float(t.ask) if t.ask is not None and t.ask != -1 else 0.0
-            last = float(t.last) if t.last is not None and t.last != -1 else 0.0
+            bid = _safe_float(t.bid)
+            ask = _safe_float(t.ask)
+            last = _safe_float(t.last)
+            vol = _safe_int(getattr(t, "volume", None))
+            oi = _safe_int(
+                getattr(t, "callOpenInterest", None) if c.right == "C" else getattr(t, "putOpenInterest", None)
+            )
             exp = _parse_expiration(c.lastTradeDateOrContractMonth)
             out.append(
                 OptionQuote(
                     expiration=exp,
-                    strike=float(c.strike),
+                    strike=_safe_float(c.strike),
                     right=c.right,
                     bid=bid,
                     ask=ask,
                     last=last,
+                    volume=vol,
+                    open_interest=oi,
                 )
             )
         return out

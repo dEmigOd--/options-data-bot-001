@@ -12,6 +12,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     stream=sys.stdout,
 )
+# Suppress noisy ib_insync messages (Error 200 "No security definition", "Unknown contract")
+logging.getLogger("ib_insync.wrapper").setLevel(logging.CRITICAL)
+logging.getLogger("ib_insync.ib").setLevel(logging.CRITICAL)
 
 
 def main() -> None:

@@ -8,7 +8,7 @@ from typing import List
 
 @dataclass
 class OptionQuote:
-    """Single option quote: strike, kind, bid/ask/last."""
+    """Single option quote: strike, kind, bid/ask/last, volume, open_interest."""
 
     expiration: date
     strike: float
@@ -16,6 +16,8 @@ class OptionQuote:
     bid: float
     ask: float
     last: float
+    volume: int = 0
+    open_interest: int = 0
 
     @property
     def is_call(self) -> bool:

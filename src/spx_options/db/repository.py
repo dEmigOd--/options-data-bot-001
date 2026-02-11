@@ -65,8 +65,8 @@ class OptionsRepository:
                 cursor.execute(
                     f"""
                     INSERT INTO dbo.[{self._table_name}]
-                    (expiration_date, strike, option_type, bid, ask, last, snapshot_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (expiration_date, strike, option_type, bid, ask, last, volume, open_interest, snapshot_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         q.expiration,
@@ -75,6 +75,8 @@ class OptionsRepository:
                         q.bid,
                         q.ask,
                         q.last,
+                        getattr(q, "volume", 0),
+                        getattr(q, "open_interest", 0),
                         snapshot_utc,
                     ),
                 )
