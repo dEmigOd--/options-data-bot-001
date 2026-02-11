@@ -1,0 +1,4 @@
+# Exclude from Cursor indexing and agent context (secrets)
+.env
+.env.*
+!.env.example

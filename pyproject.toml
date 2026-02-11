@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spx-options"
+version = "0.1.0"
+description = "SPX options chain query bot (read-only IBKR, SQL Server, UI)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "ib_insync>=0.9.86",
+    "pyodbc>=5.0.0",
+    "PyQt6>=6.6.0",
+    "pandas>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
