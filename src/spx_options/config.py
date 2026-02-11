@@ -15,12 +15,13 @@ IBKR_PASSWORD = os.getenv("IBKR_PASSWORD", "")
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))  # TWS (desktop) paper=7497 live=7496; Gateway paper=4002 live=4001
 
-# SQL Server Express
-# Example: "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\\SQLEXPRESS;DATABASE=SPXOptions;Trusted_Connection=yes;"
+# SQL Server Express (database name used for auto-create fallback)
+SQL_DATABASE = os.getenv("SQL_DATABASE", "OptionData")
+# Example: "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\\SQLEXPRESS;DATABASE=OptionData;Trusted_Connection=yes;"
 # Or with login: "...;UID=user;PWD=pass;"
 SQL_CONNECTION_STRING = os.getenv(
     "SQL_CONNECTION_STRING",
-    "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\\SQLEXPRESS;DATABASE=SPXOptions;Trusted_Connection=yes;",
+    f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER=localhost\\SQLEXPRESS;DATABASE={SQL_DATABASE};Trusted_Connection=yes;",
 )
 
 # Data

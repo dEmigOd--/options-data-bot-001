@@ -50,35 +50,35 @@ Never commit `.env`; it is listed in `.gitignore` and `.cursorignore`.
 
 ### 3. Database
 
-**Why one database?** The app uses a single database (you choose its name). Inside it we create **one table per ticker** (e.g. `option_snapshots_SPX`). The database name appears only in your connection string (e.g. `DATABASE=SPXOptions` or `DATABASE=OptionsData`); the code never hardcodes it.
+**Database name:** The app uses a single database, default name **OptionData** (set `SQL_DATABASE` or use `DATABASE=...` in your connection string). Inside it we create **one table per ticker** (e.g. `option_snapshots_SPX`).
+
+**Auto-create:** If the database does not exist, the app will connect to `master`, create it, then retry. You only need to ensure the SQL Server login can create databases (or create the database yourself once).
 
 1. Ensure **SQL Server Express** is running.
 
-2. Create a database (name is your choice):
-
-   ```sql
-   CREATE DATABASE SPXOptions;
-   ```
-
-3. **Use a SQL login** (recommended so the app does not depend on Windows auth). In SSMS or `sqlcmd`:
+2. **Use a SQL login** (recommended). In SSMS or `sqlcmd`:
 
    ```sql
    USE master;
    CREATE LOGIN spxbot WITH PASSWORD = 'YourStrongPassword1!';
-   USE SPXOptions;
+   -- Option A: let the app create the database on first run (login needs dbcreator or create OptionData manually once)
+   CREATE DATABASE OptionData;
+   USE OptionData;
    CREATE USER spxbot FOR LOGIN spxbot;
    ALTER ROLE db_datareader ADD MEMBER spxbot;
    ALTER ROLE db_datawriter ADD MEMBER spxbot;
-   ALTER ROLE db_ddladmin ADD MEMBER spxbot;   -- so the app can create tables on first run
+   ALTER ROLE db_ddladmin ADD MEMBER spxbot;
    ```
 
-4. In `.env`, set the connection string with that login (no `Trusted_Connection`):
+   Or create `OptionData` yourself; the app will create tables inside it on first run.
+
+3. In `.env`, set the connection string (no `Trusted_Connection` if using SQL login):
 
    ```
-   SQL_CONNECTION_STRING=DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\SQLEXPRESS;DATABASE=SPXOptions;UID=spxbot;PWD=YourStrongPassword1!;
+   SQL_CONNECTION_STRING=DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\SQLEXPRESS;DATABASE=OptionData;UID=spxbot;PWD=YourStrongPassword1!;
    ```
 
-   If you prefer Windows auth, use `Trusted_Connection=yes` and ensure your Windows user has access to the database (and that the database exists); otherwise you get "Login failed" or "Cannot open database".
+   If the database does not exist, the app will try to create it (requires login with permission to create databases, or create `OptionData` manually first).
 
 The app creates tables automatically on first run (e.g. `option_snapshots_SPX`). SQL Server Express (up to 10 GB per database) is enough for this use case.
 

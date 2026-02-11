@@ -1,5 +1,5 @@
 -- One table per underlying (replace __TABLE_NAME__ with e.g. option_snapshots_SPX).
--- Run against your SPXOptions database (create DB first if needed: CREATE DATABASE SPXOptions;)
+-- Run against your OptionData database (app can create DB if missing)
 
 IF NOT EXISTS (
     SELECT * FROM sys.tables t
