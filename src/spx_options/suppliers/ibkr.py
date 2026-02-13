@@ -31,6 +31,7 @@ def _safe_int(v, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
 
+from spx_options.audit import log_connection_close, log_connection_open
 from spx_options.config import IBKR_HOST, IBKR_PORT, SPX_SYMBOL
 from spx_options.security_log import log_ibkr_access
 from spx_options.suppliers.base import OptionQuote, OptionsChainSupplier
@@ -75,6 +76,7 @@ class IBKROptionsSupplier(OptionsChainSupplier):
             return
         log_ibkr_access("CONNECT", f"host={self._host} port={self._port} clientId={self._client_id}")
         self._ib.connect(self._host, self._port, clientId=self._client_id)
+        log_connection_open(self._host, self._port, self._client_id)
         if self._use_delayed_data:
             self._ib.reqMarketDataType(4)  # Delayed
         self._spx = Index(SPX_SYMBOL, "CBOE")
@@ -94,6 +96,7 @@ class IBKROptionsSupplier(OptionsChainSupplier):
 
     def disconnect(self) -> None:
         if self._ib.isConnected():
+            log_connection_close(self._host, self._port)
             self._ib.disconnect()
             log_ibkr_access("DISCONNECT", "")
 
