@@ -108,17 +108,36 @@ flowchart TB
 src/spx_options/
   position/
     __init__.py
-    leg.py          # PositionLeg dataclass
-    pricing.py      # lazy_bot_total, smart_bot_total
-  position_builder_service.py   # fetches chain, resolves legs, returns totals
+    leg.py            # PositionLeg, LegAction
+    pricing.py        # lazy_bot_total, smart_bot_total
+    builder_service.py # get_expirations, get_leg_quotes (resolve legs to bid/ask)
   ui/
-    position_builder.py        # PyQt6 window
-  audit.py                     # optional: log connection endpoints / IPs
+    position_builder.py   # PyQt6 window (worker threads for IBKR calls)
+  audit.py               # log_connection_open / log_connection_close (resolved IP)
 docs/
-  ARCHITECTURE_POSITION_BUILDER.md  # this file
+  ARCHITECTURE_POSITION_BUILDER.md
+  RUN_POSITION_BUILDER.md   # how to run with no prompts
 tests/
   test_position_pricing.py
-  test_position_builder_service.py
-run_position_builder.ps1
-RUN_POSITION_BUILDER.md
+  test_builder_service.py
+run_position_builder.ps1    # from project root: .\run_position_builder.ps1
 ```
+
+## Audit (open IP / connections)
+
+The IBKR supplier logs connection open and close to the security logger with **resolved IP**:
+
+- **CONNECTION_OPEN** – after `connect()`: host, resolved_ip, port, clientId
+- **CONNECTION_CLOSE** – before `disconnect()`: host, resolved_ip, port
+
+See `src/spx_options/audit.py` and usage in `suppliers/ibkr.py`.
+
+## How to run
+
+From project root, no input required:
+
+```powershell
+.\run_position_builder.ps1
+```
+
+See **docs/RUN_POSITION_BUILDER.md** for prerequisites and test commands.
