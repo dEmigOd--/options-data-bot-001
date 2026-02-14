@@ -14,6 +14,9 @@ IBKR_USERNAME = os.getenv("IBKR_USERNAME", "")
 IBKR_PASSWORD = os.getenv("IBKR_PASSWORD", "")
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))  # TWS (desktop) paper=7497 live=7496; Gateway paper=4002 live=4001
+# Use different client IDs so expirations and quotes workers can both connect (TWS allows one connection per client ID)
+IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
+IBKR_CLIENT_ID_QUOTES = int(os.getenv("IBKR_CLIENT_ID_QUOTES", "2"))
 
 # SQL Server Express (database name used for auto-create fallback)
 SQL_DATABASE = os.getenv("SQL_DATABASE", "OptionData")
