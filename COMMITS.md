@@ -4,6 +4,31 @@
 
 ---
 
+## Session summary (2026-02-11 — done for today)
+
+**Position Builder UI (position_builder.py) — improvements made today:**
+
+1. **Totals when adding a leg**
+   - `_recalculate_totals_from_table()` now uses `_legs` as source of truth (multipliers); requires `rowCount() == len(_legs)`; iterates by `enumerate(_legs)` so totals always match current legs.
+   - When worker returns quotes, we only apply its lazy/smart totals if `_resolved_matches_current_legs(resolved)`; otherwise we recalc from table so stale responses (e.g. after add/remove leg) don’t overwrite.
+
+2. **Clear totals when any leg has no prices**
+   - If any leg has both bid and ask empty, we show "—" (set totals unknown) instead of a partial total.
+
+3. **Clear all legs**
+   - Dust-bin button above the legs table (same icon/size as per-row remove), right-aligned above the Remove column; clears all legs, redraws table, sets totals unknown.
+
+4. **Refresh behavior**
+   - Periodic refresh: 15 s (was 5 s).
+   - When requesting a refresh we drain the worker queue (keep only latest request) so adding a new leg gets quotes as soon as the worker is free, without waiting behind old 2-leg requests.
+
+5. **Expiration date on same line**
+   - Label row now shows selected expiration date next to "Expiration (click an available date):" (e.g. `2025-03-21` or "—"); updated on calendar click and when restoring selection after add leg.
+
+**Context for next time:** All logic is in `src/spx_options/ui/position_builder.py`; pricing helpers in `src/spx_options/position/pricing.py`. Single IB worker, one queue; request_refresh(legs) drains queue then puts current legs so only latest is pending.
+
+---
+
 ## This branch: position-builder UI (suggested single commit)
 
 You have many changed files on `feature/position-builder-ui` and no commits yet. Suggested **one commit** for the whole position-builder feature (you can split later if you prefer).

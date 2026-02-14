@@ -5,7 +5,7 @@ import math
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-from ib_insync import IB, Index, Option, util
+from ib_insync import IB, Index, Option
 
 from spx_options.position.leg import PositionLeg
 from ib_insync.ib import OptionChain
@@ -32,6 +32,17 @@ def _safe_int(v, default: int = 0) -> int:
         return int(float(v))
     except (TypeError, ValueError):
         return default
+
+
+def _bid_ask_last(t: Any) -> Tuple[float, float, float]:
+    """Return (bid, ask, last). When bid/ask are 0 but last is set (e.g. market closed), use last for both."""
+    bid = _safe_float(t.bid)
+    ask = _safe_float(t.ask)
+    last = _safe_float(t.last)
+    if (bid == 0.0 and ask == 0.0) and last > 0.0:
+        return (last, last, last)
+    return (bid, ask, last)
+
 
 from spx_options.audit import log_connection_close, log_connection_open
 from spx_options.config import IBKR_CLIENT_ID, IBKR_HOST, IBKR_PORT, SPX_SYMBOL
@@ -61,11 +72,13 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         port: int = IBKR_PORT,
         client_id: int = IBKR_CLIENT_ID,
         use_delayed_data: bool = True,
+        use_frozen_data: bool = False,
     ):
         self._host = host
         self._port = port
         self._client_id = client_id
         self._use_delayed_data = use_delayed_data
+        self._use_frozen_data = use_frozen_data
         self._ib = IB()
         self._spx = None
         # SPX = monthly, SPXW = weekly; merge expirations from both for full list
@@ -81,8 +94,12 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         log_ibkr_access("CONNECT", f"host={self._host} port={self._port} clientId={self._client_id}")
         self._ib.connect(self._host, self._port, clientId=self._client_id)
         log_connection_open(self._host, self._port, self._client_id)
-        if self._use_delayed_data:
-            self._ib.reqMarketDataType(4)  # Delayed
+        # Frozen (2) = last bid/ask at market close (works when market closed, e.g. weekend)
+        # Delayed (4) = delayed frozen for users without real-time subscription
+        if self._use_frozen_data:
+            self._ib.reqMarketDataType(2)
+        elif self._use_delayed_data:
+            self._ib.reqMarketDataType(4)
         self._spx = Index(SPX_SYMBOL, "CBOE")
         self._ib.qualifyContracts(self._spx)
         chains = self._ib.reqSecDefOptParams(
@@ -178,7 +195,10 @@ class IBKROptionsSupplier(OptionsChainSupplier):
 
         log_ibkr_access("REQ_TICKERS", f"expiration={exp_str} count={len(qualified)}")
         tickers = self._ib.reqTickers(*qualified)
-        util.sleep(0.5)
+        for _ in range(15):
+            self._ib.sleep(0.1)
+            if any(_safe_float(t.bid) != 0 or _safe_float(t.ask) != 0 or _safe_float(t.last) != 0 for t in tickers):
+                break
 
         out: List[OptionQuote] = []
         for t in tickers:
@@ -242,8 +262,14 @@ class IBKROptionsSupplier(OptionsChainSupplier):
             return out
         log_ibkr_access("REQ_TICKERS", f"legs={len(qualified)} (active legs only)")
         tickers = self._ib.reqTickers(*qualified)
-        # Allow time for all tickers to receive data (streaming)
-        util.sleep(0.5)
+        # Run event loop until all tickers have data or 2s max (so every leg gets bid/ask)
+        for _ in range(20):
+            self._ib.sleep(0.1)
+            if all(
+                _safe_float(t.bid) != 0 or _safe_float(t.ask) != 0 or _safe_float(t.last) != 0
+                for t in tickers
+            ):
+                break
         # Map each ticker to (exp, strike, right) so we assign to the correct leg regardless of order
         ticker_by_key: Dict[Tuple[date, float, str], Any] = {}
         for t in tickers:
@@ -263,13 +289,14 @@ class IBKROptionsSupplier(OptionsChainSupplier):
                 d = getattr(greeks, "delta", None)
                 if d is not None and d != -1:
                     delta_val = _safe_float(d)
+            bid, ask, last = _bid_ask_last(t)
             out[i] = OptionQuote(
                 expiration=_parse_expiration(c.lastTradeDateOrContractMonth),
                 strike=_safe_float(c.strike),
                 right=c.right,
-                bid=_safe_float(t.bid),
-                ask=_safe_float(t.ask),
-                last=_safe_float(t.last),
+                bid=bid,
+                ask=ask,
+                last=last,
                 volume=_safe_int(getattr(t, "volume", None)),
                 open_interest=_safe_int(
                     getattr(t, "callOpenInterest", None) if c.right == "C" else getattr(t, "putOpenInterest", None)

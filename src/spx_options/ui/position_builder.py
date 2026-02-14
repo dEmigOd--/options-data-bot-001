@@ -4,6 +4,7 @@ Runs IBKR supplier calls in a worker thread to keep UI responsive.
 """
 
 import asyncio
+import queue
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +45,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from spx_options.config import IBKR_CLIENT_ID_QUOTES
+from spx_options.config import IBKR_CLIENT_ID
 from spx_options.position import (
     LegAction,
     PositionLeg,
@@ -176,62 +177,79 @@ def _run_leg_quotes(
     return get_leg_quotes(supplier, legs)
 
 
-def _run_in_thread_with_loop(callable_fn, *args, **kwargs):
-    """Run a blocking call in a thread that has its own asyncio event loop (required by ib_insync)."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return callable_fn(*args, **kwargs)
-    finally:
-        loop.close()
-
-
-class _ExpirationsWorker(QThread):
-    """Thread: load expirations and emit result. Uses its own asyncio loop for ib_insync."""
-
-    def __init__(self, supplier: OptionsChainSupplier) -> None:
-        super().__init__()
-        self.supplier = supplier
-        self.signals = _WorkerSignals()
-
-    def run(self) -> None:
-        try:
-            expirations = _run_in_thread_with_loop(_run_expirations, self.supplier)
-            self.signals.expirations_ready.emit(expirations)
-        except Exception as e:
-            get_connection_logger().error("Load expirations failed: %s", e)
-            msg = (str(e) or "").strip() or f"{type(e).__name__}: connection failed"
-            self.signals.error.emit(msg)
-
-
-class _LegQuotesWorker(QThread):
-    """Thread: load leg quotes and totals. Creates its own supplier in this thread so the
-    IB connection is not shared with the expirations worker (ib_insync is not thread-safe).
+class _IBWorker(QThread):
+    """Single worker: one IB connection for expirations and for all leg quotes.
+    Connects once, loads expirations, then processes quote requests (all legs at once per request).
     """
 
-    def __init__(self, legs: List[PositionLeg]) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.legs = legs
+        self._request_queue: "queue.Queue[Optional[List[PositionLeg]]]" = queue.Queue()
         self.signals = _WorkerSignals()
 
-    def run(self) -> None:
-        supplier = IBKROptionsSupplier(client_id=IBKR_CLIENT_ID_QUOTES)
+    def request_refresh(self, legs: List[PositionLeg]) -> None:
+        """Request quotes for all legs in one go (thread-safe).
+        Drops any pending requests so only this one is queued; new legs get filled as soon as worker is free.
+        """
         try:
-            resolved, lazy, smart = _run_in_thread_with_loop(
-                _run_leg_quotes,
-                supplier,
-                self.legs,
-            )
-            self.signals.leg_quotes_ready.emit(resolved, lazy, smart)
-        except Exception as e:
-            get_connection_logger().error("Load leg quotes failed: %s", e)
-            msg = (str(e) or "").strip() or f"{type(e).__name__}: connection failed (timeout or client ID in use)"
-            self.signals.error.emit(msg)
-        finally:
+            drained: List[Optional[List[PositionLeg]]] = []
+            while True:
+                try:
+                    x = self._request_queue.get_nowait()
+                    if x is None:
+                        drained.append(None)
+                except queue.Empty:
+                    break
+            for x in drained:
+                self._request_queue.put(x)
+        except Exception:
+            pass
+        self._request_queue.put(legs)
+
+    def stop(self) -> None:
+        """Ask the worker to disconnect and exit."""
+        self._request_queue.put(None)
+
+    def run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        supplier: Optional[IBKROptionsSupplier] = None
+        try:
+            supplier = IBKROptionsSupplier(client_id=IBKR_CLIENT_ID, use_frozen_data=True)
             try:
-                supplier.disconnect()
-            except Exception:
-                pass
+                supplier.connect()
+            except Exception as e:
+                get_connection_logger().error("Connection failed: %s", e)
+                self.signals.error.emit((str(e) or "").strip() or "Connection failed")
+                return
+            try:
+                expirations = supplier.get_expirations()
+                self.signals.expirations_ready.emit(expirations)
+            except Exception as e:
+                get_connection_logger().error("Load expirations failed: %s", e)
+                self.signals.error.emit((str(e) or "").strip() or "Load expirations failed")
+                return
+            while True:
+                legs = self._request_queue.get()
+                if legs is None:
+                    break
+                if not legs:
+                    continue
+                try:
+                    resolved, lazy, smart = _run_leg_quotes(supplier, legs)
+                    self.signals.leg_quotes_ready.emit(resolved, lazy, smart)
+                except Exception as e:
+                    get_connection_logger().error("Load leg quotes failed: %s", e)
+                    self.signals.error.emit(
+                        (str(e) or "").strip() or "Load leg quotes failed"
+                    )
+        finally:
+            if supplier is not None:
+                try:
+                    supplier.disconnect()
+                except Exception:
+                    pass
+            loop.close()
 
 
 # ---- Main window ----
@@ -279,13 +297,11 @@ class PositionBuilderWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Position Builder – Lazy / Smart bot price")
-        self._supplier: Optional[IBKROptionsSupplier] = None
         self._expirations: List[date] = []
         self._expirations_set: set = set()  # fast lookup for calendar
         self._selected_expiration: Optional[date] = None
         self._legs: List[PositionLeg] = []
-        self._expirations_worker: Optional[_ExpirationsWorker] = None
-        self._quotes_worker: Optional[_LegQuotesWorker] = None
+        self._ib_worker: Optional[_IBWorker] = None
         self._refresh_after_quotes_loaded = False  # when True, run one more refresh when worker finishes (e.g. leg added while worker running)
         self._connected = False
         self._last_connect_was_auto = False
@@ -294,7 +310,7 @@ class PositionBuilderWindow(QMainWindow):
         self._lazy_total: Optional[float] = None  # for P&L chart cost basis
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_prices)
-        self._refresh_timer.setInterval(5_000)  # 5 seconds; active legs only, started when connected
+        self._refresh_timer.setInterval(15_000)  # 15 seconds; active legs only, started when connected
         self._reconnect_timer = QTimer(self)
         self._reconnect_timer.timeout.connect(self._on_auto_reconnect)
         self._reconnect_timer.setInterval(60_000)  # 1 minute
@@ -339,7 +355,15 @@ class PositionBuilderWindow(QMainWindow):
         ticker_layout.addStretch()
         left_layout.addWidget(ticker_group)
 
-        left_layout.addWidget(QLabel("Expiration (click an available date):"))
+        exp_row = QWidget()
+        exp_row_layout = QHBoxLayout(exp_row)
+        exp_row_layout.setContentsMargins(0, 0, 0, 0)
+        exp_row_layout.addWidget(QLabel("Expiration (click an available date):"))
+        self.expiration_date_label = QLabel("—")
+        self.expiration_date_label.setStyleSheet("font-weight: bold;")
+        exp_row_layout.addWidget(self.expiration_date_label)
+        exp_row_layout.addStretch()
+        left_layout.addWidget(exp_row)
         self.expiration_calendar = QCalendarWidget()
         self.expiration_calendar.setMinimumSize(320, 260)
         self.expiration_calendar.setGridVisible(True)
@@ -402,6 +426,22 @@ class PositionBuilderWindow(QMainWindow):
         right_layout.addWidget(leg_group)
 
         right_layout.addWidget(QLabel("Legs (Bid / Ask from market):"))
+        legs_header_widget = QWidget()
+        legs_header_layout = QHBoxLayout(legs_header_widget)
+        legs_header_layout.setContentsMargins(0, 0, 0, 2)
+        legs_header_layout.addStretch()
+        self.clear_all_legs_btn = QPushButton()
+        _style = QApplication.instance().style() if QApplication.instance() else None
+        _trash = _style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon) if _style else None
+        if _trash:
+            self.clear_all_legs_btn.setIcon(_trash)
+        else:
+            self.clear_all_legs_btn.setText("\u2716")
+        self.clear_all_legs_btn.setToolTip("Clear all legs")
+        self.clear_all_legs_btn.setFixedSize(28, 22)
+        self.clear_all_legs_btn.clicked.connect(self._on_clear_all_legs)
+        legs_header_layout.addWidget(self.clear_all_legs_btn)
+        right_layout.addWidget(legs_header_widget)
         self.legs_table = QTableWidget()
         self.legs_table.setColumnCount(10)
         self.legs_table.setHorizontalHeaderLabels(
@@ -442,7 +482,7 @@ class PositionBuilderWindow(QMainWindow):
         right_layout.addWidget(summary_group)
 
         self.refresh_btn = QPushButton("Refresh prices")
-        self.refresh_btn.clicked.connect(self._refresh_prices)
+        self.refresh_btn.clicked.connect(self._request_leg_prices_refresh)
         right_layout.addWidget(self.refresh_btn)
 
         self.status_label = QLabel("")
@@ -460,7 +500,7 @@ class PositionBuilderWindow(QMainWindow):
         if not self._connection_attempted_on_show:
             self._connection_attempted_on_show = True
             self._last_connect_was_auto = True
-            self._start_expirations_worker()
+            self._start_ib_worker()
 
     def _set_status_error(self, text: str) -> None:
         """Show error in status bar (red); no popup."""
@@ -472,63 +512,76 @@ class PositionBuilderWindow(QMainWindow):
         self.status_label.setText(text)
         self.status_label.setStyleSheet("color: gray; font-size: 11px;")
 
-    def _get_supplier(self) -> Optional[IBKROptionsSupplier]:
-        """Return supplier instance; connection happens in worker thread on first use."""
-        if self._supplier is None:
-            self._supplier = IBKROptionsSupplier()
-        return self._supplier
-
     def _set_connection_status(self, connected: bool) -> None:
-        """Update connection status label, style, refresh timer, and Connect button (enabled only when disconnected)."""
+        """Update connection status label, style, refresh timer, and Connect button."""
         self._connected = connected
         if connected:
             self.connection_label.setText("Connected")
             self.connection_label.setStyleSheet("font-weight: bold; color: darkgreen;")
-            self._refresh_timer.start()
             self.connect_btn.setEnabled(False)
+            QTimer.singleShot(600, self._request_leg_prices_refresh)
+            self._refresh_timer.start()
         else:
             self.connection_label.setText("Disconnected")
             self.connection_label.setStyleSheet("font-weight: bold; color: gray;")
             self._refresh_timer.stop()
             self.connect_btn.setEnabled(True)
+            if self._ib_worker is not None:
+                self._ib_worker.stop()
+                self._ib_worker.wait(5000)
+                try:
+                    self._ib_worker.signals.expirations_ready.disconnect()
+                    self._ib_worker.signals.leg_quotes_ready.disconnect()
+                    self._ib_worker.signals.error.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self._ib_worker = None
 
-    def _start_expirations_worker(self) -> None:
-        """Start background worker to load expirations (and thus establish connection)."""
-        if self._expirations_worker is not None and self._expirations_worker.isRunning():
+    def _start_ib_worker(self) -> None:
+        """Start single IB worker: connect, load expirations, then process quote requests (all legs at once)."""
+        if self._ib_worker is not None and self._ib_worker.isRunning():
             return
-        supplier = self._get_supplier()
         get_connection_logger().info("Connection attempt (load expirations)...")
         self.load_exp_btn.setEnabled(False)
         self.connect_btn.setEnabled(False)
-        self._expirations_worker = _ExpirationsWorker(supplier)
-        self._expirations_worker.signals.expirations_ready.connect(self._on_expirations_loaded)
-        self._expirations_worker.signals.error.connect(self._on_expirations_error)
-        self._expirations_worker.finished.connect(self._on_expirations_worker_finished)
-        self._expirations_worker.start()
+        self._ib_worker = _IBWorker()
+        self._ib_worker.signals.expirations_ready.connect(self._on_expirations_loaded)
+        self._ib_worker.signals.leg_quotes_ready.connect(self._on_leg_quotes_loaded)
+        self._ib_worker.signals.leg_quotes_ready.connect(lambda *a: self._set_connection_status(True))
+        self._ib_worker.signals.error.connect(self._on_ib_worker_error)
+        self._ib_worker.finished.connect(self._on_ib_worker_finished)
+        self._ib_worker.start()
 
-    def _on_expirations_worker_finished(self) -> None:
-        """Re-enable Load expirations; Connect stays disabled if connected, enabled if still disconnected."""
+    def _on_ib_worker_finished(self) -> None:
+        """Re-enable Load expirations; Connect enabled only if disconnected."""
         self.load_exp_btn.setEnabled(True)
         self.connect_btn.setEnabled(not self._connected)
+
+    def _on_ib_worker_error(self, message: str) -> None:
+        """Single error handler: connection/expirations vs quotes."""
+        if self._connected:
+            self._on_quotes_error(message)
+        else:
+            self._on_expirations_error(message)
 
     def _on_connect_clicked(self) -> None:
         """Try to connect now (same as loading expirations; shows error on failure)."""
         self._last_connect_was_auto = False
-        self._start_expirations_worker()
+        self._start_ib_worker()
 
     def _on_auto_reconnect(self) -> None:
         """Once per minute: if disconnected, try to connect without showing error on failure."""
         if self._connected:
             return
-        if self._expirations_worker is not None and self._expirations_worker.isRunning():
+        if self._ib_worker is not None and self._ib_worker.isRunning():
             return
         self._last_connect_was_auto = True
-        self._start_expirations_worker()
+        self._start_ib_worker()
 
     def _on_load_expirations(self) -> None:
-        """Start worker to load expirations for current ticker."""
+        """Start worker: connect and load expirations (same connection used for leg quotes)."""
         self._last_connect_was_auto = False
-        self._start_expirations_worker()
+        self._start_ib_worker()
 
     def _on_expirations_loaded(self, expirations: list) -> None:
         """Fill calendar with available expirations (highlight clickable dates) and mark connected."""
@@ -571,21 +624,29 @@ class PositionBuilderWindow(QMainWindow):
         elif self._connected:
             self._refresh_timer.start()
 
+    def _update_expiration_date_label(self) -> None:
+        """Show selected expiration date on the same line as the Expiration label."""
+        if self._selected_expiration is not None:
+            self.expiration_date_label.setText(self._selected_expiration.strftime("%Y-%m-%d"))
+        else:
+            self.expiration_date_label.setText("—")
+
     def _on_calendar_date_clicked(self, qdate: QDate) -> None:
         """When user clicks a date, use it if it is an available expiration (weekly/monthly)."""
         d = qdate.toPyDate()
         if d in self._expirations_set:
             self._selected_expiration = d
             self.expiration_calendar.setSelectedDate(qdate)
+            self._update_expiration_date_label()
             self.add_leg_btn.setEnabled(True)
-            self._refresh_prices()
+            self._request_leg_prices_refresh()
         else:
             self._set_status_ok("Date not available; click a highlighted date.")
 
     def _on_expiration_selected(self) -> None:
         """Called when selection should refresh; enable Add leg and refresh prices if we have legs."""
         self.add_leg_btn.setEnabled(self._current_expiration() is not None)
-        self._refresh_prices()
+        self._request_leg_prices_refresh()
 
     def _leg_sort_key(self, leg: PositionLeg) -> Tuple[date, int, float]:
         """Order: expiration ascending, calls before puts, strike ascending."""
@@ -604,6 +665,7 @@ class PositionBuilderWindow(QMainWindow):
             self.expiration_calendar.blockSignals(True)
             self.expiration_calendar.setSelectedDate(QDate(exp.year, exp.month, exp.day))
             self.expiration_calendar.blockSignals(False)
+            self._update_expiration_date_label()
             self.add_leg_btn.setEnabled(True)
 
     def _on_add_leg(self) -> None:
@@ -644,7 +706,8 @@ class PositionBuilderWindow(QMainWindow):
                     )
                 self._sort_legs()
                 self._redraw_legs_table()
-                self._refresh_prices()
+                self._recalculate_totals_from_table()
+                self._request_leg_prices_refresh()
                 self._restore_expiration_selection(exp)
                 return
         self._legs.append(
@@ -652,7 +715,8 @@ class PositionBuilderWindow(QMainWindow):
         )
         self._sort_legs()
         self._redraw_legs_table()
-        self._refresh_prices()
+        self._recalculate_totals_from_table()
+        self._request_leg_prices_refresh()
         self._restore_expiration_selection(exp)
 
     def _on_edit_leg(self, row: int) -> None:
@@ -705,13 +769,15 @@ class PositionBuilderWindow(QMainWindow):
                     self._legs.pop(row)
                 self._sort_legs()
                 self._redraw_legs_table()
-                self._refresh_prices()
+                self._recalculate_totals_from_table()
+                self._request_leg_prices_refresh()
                 return
         # No merge: replace this row's leg (strike/exp/right change -> no price in hand, redraw gives empty for that key)
         self._legs[row] = new_leg
         self._sort_legs()
         self._redraw_legs_table()
-        self._refresh_prices()
+        self._recalculate_totals_from_table()
+        self._request_leg_prices_refresh()
 
     def _row_for_cell_widget(self, widget: QWidget, column: int) -> int:
         """Return the table row that contains the given cell widget, or -1."""
@@ -732,7 +798,15 @@ class PositionBuilderWindow(QMainWindow):
         self.legs_table.removeRow(row)
         self._redraw_legs_table()
         self._recalculate_totals_from_table()
-        self._refresh_prices()
+        self._request_leg_prices_refresh()
+
+    def _on_clear_all_legs(self) -> None:
+        """Remove all legs; clear table and totals."""
+        if not self._legs:
+            return
+        self._legs.clear()
+        self._redraw_legs_table()
+        self._set_totals_unknown()
 
     def _on_edit_clicked(self) -> None:
         """Open edit dialog for the leg in the row of the edit button that was clicked."""
@@ -773,19 +847,21 @@ class PositionBuilderWindow(QMainWindow):
         return (exp, strike, right)
 
     def _recalculate_totals_from_table(self) -> None:
-        """Compute lazy/smart totals from current table bid/ask and update labels."""
+        """Compute lazy/smart totals from current table bid/ask and update labels.
+        Uses _legs as source of truth (multipliers); table row i must correspond to _legs[i].
+        """
         if not self._legs:
             self._set_totals_unknown()
             return
+        if self.legs_table.rowCount() != len(self._legs):
+            self._set_totals_unknown()
+            return
         resolved: List[Tuple[PositionLeg, float, float]] = []
-        for row in range(self.legs_table.rowCount()):
-            if row >= len(self._legs):
-                break
-            leg = self._legs[row]
+        for row, leg in enumerate(self._legs):
             bid_item = self.legs_table.item(row, COL_BID)
             ask_item = self.legs_table.item(row, COL_ASK)
-            bid_s = (bid_item.text() or "").strip()
-            ask_s = (ask_item.text() or "").strip()
+            bid_s = (bid_item.text() or "").strip() if bid_item else ""
+            ask_s = (ask_item.text() or "").strip() if ask_item else ""
             try:
                 bid = float(bid_s) if bid_s else 0.0
             except ValueError:
@@ -795,6 +871,9 @@ class PositionBuilderWindow(QMainWindow):
             except ValueError:
                 ask = 0.0
             resolved.append((leg, bid, ask))
+        if any(bid == 0.0 and ask == 0.0 for _, bid, ask in resolved):
+            self._set_totals_unknown()
+            return
         lazy = lazy_bot_total(resolved)
         smart = smart_bot_total(resolved)
         self._set_totals(lazy, smart)
@@ -916,12 +995,12 @@ class PositionBuilderWindow(QMainWindow):
                     self._legs.pop(row)
                 self._sort_legs()
                 self._redraw_legs_table()
-                self._refresh_prices()
+                self._request_leg_prices_refresh()
                 return
         self._legs[row] = new_leg
         self._sort_legs()
         self._redraw_legs_table()
-        self._refresh_prices()
+        self._request_leg_prices_refresh()
 
     def _redraw_legs_table(self) -> None:
         """Rebuild table rows from _legs; preserve bid/ask/delta by (date, strike, type) from current table content."""
@@ -997,36 +1076,43 @@ class PositionBuilderWindow(QMainWindow):
             self.legs_table.setCellWidget(row, COL_REMOVE, remove_btn)
 
     def _refresh_prices(self) -> None:
-        """Start worker to get leg quotes (all current legs). If a worker is already running, schedule one more refresh when it finishes."""
+        """Request quotes for all legs at once from the single IB worker."""
         if not self._legs:
             self._set_totals_unknown()
             return
-        if not self._connected:
+        if not self._connected or self._ib_worker is None or not self._ib_worker.isRunning():
             return
-        if self._quotes_worker is not None and self._quotes_worker.isRunning():
-            # Match/execute: schedule one more refresh with current legs when this worker finishes
-            self._refresh_after_quotes_loaded = True
-            self._refresh_timer.stop()  # remove pending timer so we have one logical "waiting" request
+        self._ib_worker.request_refresh(self._legs.copy())
+
+    def _request_leg_prices_refresh(self) -> None:
+        """Trigger a price fetch (e.g. after add/edit/remove leg). Ensures periodic timer keeps running."""
+        if not self._legs:
             return
-        # Disconnect previous worker so we only handle the latest worker
-        if self._quotes_worker is not None:
-            try:
-                self._quotes_worker.signals.leg_quotes_ready.disconnect()
-                self._quotes_worker.signals.error.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-        self._refresh_timer.stop()  # remove from queue until this request completes
-        self._quotes_worker = _LegQuotesWorker(self._legs.copy())
-        self._quotes_worker.signals.leg_quotes_ready.connect(self._on_leg_quotes_loaded)
-        self._quotes_worker.signals.leg_quotes_ready.connect(
-            lambda *a: self._set_connection_status(True)
-        )
-        self._quotes_worker.signals.error.connect(self._on_quotes_error)
-        self._quotes_worker.start()
+        self._refresh_prices()
+        if self._connected:
+            self._refresh_timer.start()  # (re)start 15s periodic fetch
 
     def _current_expiration(self) -> Optional[date]:
         """Return selected expiration date or None."""
         return self._selected_expiration
+
+    def _resolved_matches_current_legs(
+        self,
+        resolved: List[Tuple[PositionLeg, float, float, Optional[float]]],
+    ) -> bool:
+        """True iff resolved has same length and same (exp, strike, right) per index as _legs."""
+        if len(resolved) != len(self._legs):
+            return False
+        for i, item in enumerate(resolved):
+            leg = item[0]
+            current = self._legs[i]
+            if (
+                leg.expiration != current.expiration
+                or leg.strike != current.strike
+                or leg.right.upper() != current.right.upper()
+            ):
+                return False
+        return True
 
     def _on_leg_quotes_loaded(
         self,
@@ -1034,7 +1120,10 @@ class PositionBuilderWindow(QMainWindow):
         lazy_total: float,
         smart_total: float,
     ) -> None:
-        """Update table bid/ask/delta by (date, strike, type); keep existing until we have new data."""
+        """Update table bid/ask/delta by (date, strike, type); keep existing until we have new data.
+        Only use worker's totals if resolved matches current _legs; otherwise recalc from table
+        so multipliers/leg set are correct (avoids stale response overwriting after add/remove leg).
+        """
         self._set_status_ok("")
         for item in resolved:
             leg = item[0]
@@ -1053,10 +1142,16 @@ class PositionBuilderWindow(QMainWindow):
                 self.legs_table.setItem(row, COL_ASK, ask_item)
             if delta is not None:
                 self.legs_table.setItem(row, COL_DELTA, QTableWidgetItem(f"{delta:.2f}"))
-        self._set_totals(lazy_total, smart_total)
-        # If all quotes are zero, hint that strikes may not be in chain
+        if self._resolved_matches_current_legs(resolved):
+            self._set_totals(lazy_total, smart_total)
+        else:
+            self._recalculate_totals_from_table()
+        # If all quotes are zero, hint: market closed (e.g. weekend) or strike not in chain
         if resolved and all(bid == 0.0 and ask == 0.0 for _, bid, ask, _ in resolved):
-            self._set_status_ok("No quotes for these strikes/expirations; check strike is in chain.")
+            self._set_status_ok(
+                "No bid/ask (market may be closed—e.g. weekend). "
+                "Otherwise check strike/expiration is in the chain."
+            )
         # If a leg was added while this worker was running, run one more refresh with current legs
         if self._refresh_after_quotes_loaded:
             self._refresh_after_quotes_loaded = False
@@ -1113,13 +1208,11 @@ class PositionBuilderWindow(QMainWindow):
             self._pnl_axis_y.setRange(-1, 1)
 
     def closeEvent(self, event: Any) -> None:
-        """Disconnect supplier on close."""
-        if self._supplier is not None:
-            try:
-                self._supplier.disconnect()
-            except Exception:
-                pass
-            self._supplier = None
+        """Stop single IB worker on close."""
+        if self._ib_worker is not None:
+            self._ib_worker.stop()
+            self._ib_worker.wait(3000)
+            self._ib_worker = None
         super().closeEvent(event)
 
 
