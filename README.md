@@ -9,10 +9,11 @@ Automation for querying and storing SPX options chain data (read-only) from Inte
 - **UI**: Pick expiration, option kind (call/put), strike; view option price vs time in a chart.
 - **Suppliers**: Pluggable interface (e.g. IBKR); read-only access with security logging.
 
-**Two ways to run:**
+**Three ways to run:**
 
 1. **Collector (bot)** – Connects to IBKR (TWS or Gateway), fetches the options chain every minute, and writes snapshots to the database. Run this and leave it running to build history.
 2. **UI** – Reads from the database so you can select an expiration, call/put, strike and see bid/ask/last vs time. Use this after the collector has stored some data.
+3. **Position Builder** – Live multi-leg options builder: pick ticker and expirations from IBKR, add legs (strike, call/put, buy/sell), see bid/ask/delta and composite lazy/smart bot price, and a P&L-at-expiration curve. See [docs/RUN_POSITION_BUILDER.md](docs/RUN_POSITION_BUILDER.md) for how to run and how it works.
 
 ---
 
@@ -116,6 +117,14 @@ Leave this running. It will connect to TWS/Gateway and store a chain snapshot ev
 
 Use the UI to choose expiration, call/put, strike and view price vs time (after the collector has written some data).
 
+**Start the Position Builder:**
+
+```powershell
+.\run_position_builder.ps1
+```
+
+Build a multi-leg position with live IBKR prices, composite price, and P&L at expiration. See [docs/RUN_POSITION_BUILDER.md](docs/RUN_POSITION_BUILDER.md).
+
 ### Option B: Install package and use Python directly
 
 Install the package in editable mode once:
@@ -165,10 +174,13 @@ Repository and collector tests need a working SQL Server connection; they are sk
   - `db/` – SQL Server connection, schema, repository (insert/query snapshots).
   - `collector.py` – 1‑minute loop: fetch chain, insert into DB.
   - `collector_main.py` – Entry point for the collector.
+  - `position/` – Position legs, pricing (lazy/smart bot), P&L at expiry curve; builder service for leg quotes.
   - `ui/main.py` – PyQt6 UI: expiration, kind, strike, price vs time chart.
+  - `ui/position_builder.py` – Position Builder: ticker, expirations, legs table, composite price, P&L chart (see docs/RUN_POSITION_BUILDER.md).
 - **`run_collector.ps1`** – PowerShell launcher for the collector (sets `PYTHONPATH`, runs collector).
 - **`run_ui.ps1`** – PowerShell launcher for the UI.
-- **`tests/`** – Unit tests (suppliers, repository, collector, .gitignore).
+- **`run_position_builder.ps1`** – PowerShell launcher for the Position Builder.
+- **`tests/`** – Unit tests (suppliers, repository, collector, position, .gitignore).
 
 ---
 

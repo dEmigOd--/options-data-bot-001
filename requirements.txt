@@ -6,6 +6,7 @@ pyodbc>=5.0.0
 
 # UI
 PyQt6>=6.6.0
+PyQt6-Charts>=6.2.0  # P&L chart in Position Builder (optional at runtime)
 
 # Utilities
 pandas>=2.0.0

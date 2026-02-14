@@ -1,10 +1,39 @@
 # Commit plan
 
-**Rule from now on:** After each logical change we prepare one commit. You review the suggested message and run the commit yourself (or approve and I don’t run git).
+**Rule from now on:** After each logical change we prepare one commit. You review the suggested message and run the commit yourself (or approve and I don't run git).
 
 ---
 
-## Suggested chunks (if you’re cleaning up one big blob)
+## This branch: position-builder UI (suggested single commit)
+
+You have many changed files on `feature/position-builder-ui` and no commits yet. Suggested **one commit** for the whole position-builder feature (you can split later if you prefer).
+
+**Files to stage:**  
+All modified + new: `docs/RUN_POSITION_BUILDER.md`, `README.md`, `requirements.txt`, `src/spx_options/config.py`, `src/spx_options/position/` (builder_service, leg, pricing, pnl_curve), `src/spx_options/suppliers/base.py`, `src/spx_options/suppliers/ibkr.py`, `src/spx_options/ui/position_builder.py`, `src/spx_options/ui/connection_log.py`, `tests/test_builder_service.py`, `tests/test_position_pricing.py`, `COMMITS.md`.
+
+**Suggested message:** feat: Position Builder UI with legs, prices, P&L chart, two-column layout (full multi-line message in the command block below).
+
+**Commands (run from project root):**
+
+```powershell
+git add docs/RUN_POSITION_BUILDER.md README.md requirements.txt COMMITS.md
+git add src/spx_options/config.py src/spx_options/position/
+git add src/spx_options/suppliers/base.py src/spx_options/suppliers/ibkr.py
+git add src/spx_options/ui/position_builder.py src/spx_options/ui/connection_log.py
+git add tests/test_builder_service.py tests/test_position_pricing.py
+git commit -m "feat: Position Builder UI with legs, prices, P&L chart, two-column layout
+
+- UI: ticker, expirations calendar, add/edit/remove legs, bid/ask/delta, lazy/smart bot price, P&L at expiry (PyQt6-Charts), scroll area, two-column layout (connection/calendar/P&L left; add leg/table/summary right)
+- Position: builder_service, pnl_curve, leg, pricing; quotes keyed by (date, strike, type)
+- IBKR: separate client IDs for expirations vs quotes, leg-only quotes, delta from Greeks, 5s refresh, add-leg triggers refresh
+- Config: IBKR_CLIENT_ID, IBKR_CLIENT_ID_QUOTES
+- Docs: README Position Builder section, RUN_POSITION_BUILDER how-to and how-it-works
+- Tests: builder_service, position_pricing"
+```
+
+---
+
+## Suggested chunks (if you're cleaning up one big blob)
 
 Run these in order so history is readable. Adjust file lists to what you actually have uncommitted.
 
@@ -61,7 +90,7 @@ docs: database setup and SQL login; add COMMITS.md
 - COMMITS.md: chunked commit plan and rule to review each commit message
 ```
 
-Review the message; if it’s good, stage and commit:
+Review the message; if it's good, stage and commit:
 
 ```powershell
 git add README.md .env.example COMMITS.md
