@@ -3,9 +3,11 @@
 import logging
 import math
 from datetime import date, datetime, timezone
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 from ib_insync import IB, Index, Option, util
+
+from spx_options.position.leg import PositionLeg
 from ib_insync.ib import OptionChain
 
 
@@ -32,7 +34,7 @@ def _safe_int(v, default: int = 0) -> int:
         return default
 
 from spx_options.audit import log_connection_close, log_connection_open
-from spx_options.config import IBKR_HOST, IBKR_PORT, SPX_SYMBOL
+from spx_options.config import IBKR_CLIENT_ID, IBKR_HOST, IBKR_PORT, SPX_SYMBOL
 from spx_options.security_log import log_ibkr_access
 from spx_options.suppliers.base import OptionQuote, OptionsChainSupplier
 
@@ -57,7 +59,7 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         self,
         host: str = IBKR_HOST,
         port: int = IBKR_PORT,
-        client_id: int = 1,
+        client_id: int = IBKR_CLIENT_ID,
         use_delayed_data: bool = True,
     ):
         self._host = host
@@ -66,9 +68,11 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         self._use_delayed_data = use_delayed_data
         self._ib = IB()
         self._spx = None
-        self._chain_params = None
-        self._trading_class = "SPX"
+        # SPX = monthly, SPXW = weekly; merge expirations from both for full list
+        self._trading_classes = ("SPX", "SPXW")
         self._exchange = "SMART"
+        # Map expiration date -> (chain_params, trading_class) for get_chain(exp)
+        self._expiration_to_chain: Dict[date, Tuple[Any, str]] = {}
 
     def connect(self) -> None:
         """Connect to TWS/Gateway. Call before get_expirations/get_chain."""
@@ -84,15 +88,35 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         chains = self._ib.reqSecDefOptParams(
             self._spx.symbol, "", self._spx.secType, self._spx.conId
         )
+        self._expiration_to_chain = {}
         for c in chains:
-            if getattr(c, "tradingClass", None) == self._trading_class and getattr(
-                c, "exchange", None
-            ) in (self._exchange, "CBOE"):
-                self._chain_params = c
-                break
-        if not self._chain_params:
-            self._chain_params = chains[0]
-        log_ibkr_access("SEC_DEF_OPT_PARAMS", f"expirations={len(getattr(self._chain_params, 'expirations', []))} strikes={len(getattr(self._chain_params, 'strikes', []))}")
+            trading_class = getattr(c, "tradingClass", None)
+            exchange = getattr(c, "exchange", None)
+            if trading_class not in self._trading_classes:
+                continue
+            if exchange not in (self._exchange, "CBOE"):
+                continue
+            exp_strs = getattr(c, "expirations", []) or []
+            for s in exp_strs:
+                try:
+                    d = _parse_expiration(s)
+                    self._expiration_to_chain[d] = (c, trading_class)
+                except ValueError:
+                    continue
+        if not self._expiration_to_chain and chains:
+            # Fallback: use first chain (legacy behaviour)
+            c = chains[0]
+            trading_class = getattr(c, "tradingClass", "SPX")
+            for s in getattr(c, "expirations", []) or []:
+                try:
+                    d = _parse_expiration(s)
+                    self._expiration_to_chain[d] = (c, trading_class)
+                except ValueError:
+                    continue
+        log_ibkr_access(
+            "SEC_DEF_OPT_PARAMS",
+            f"expirations={len(self._expiration_to_chain)} (SPX+SPXW merged)",
+        )
 
     def disconnect(self) -> None:
         if self._ib.isConnected():
@@ -108,16 +132,29 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         self.disconnect()
 
     def get_expirations(self) -> List[date]:
-        """Return available SPX option expiration dates."""
+        """Return available SPX option expiration dates (monthly SPX + weekly SPXW merged)."""
         self.connect()
-        exp_strs = getattr(self._chain_params, "expirations", []) or []
-        return sorted(_parse_expiration(s) for s in exp_strs)
+        return sorted(self._expiration_to_chain.keys())
+
+    def get_strikes(self, expiration: date) -> List[float]:
+        """Return available strikes for the expiration (from sec def only; no contract/quote requests)."""
+        self.connect()
+        chain_info = self._expiration_to_chain.get(expiration)
+        if not chain_info:
+            return []
+        chain_params, _ = chain_info
+        return list(getattr(chain_params, "strikes", []) or [])
 
     def get_chain(self, expiration: date) -> List[OptionQuote]:
         """Return full chain (all strikes, calls and puts) for the given expiration."""
         self.connect()
+        chain_info = self._expiration_to_chain.get(expiration)
+        if not chain_info:
+            logger.warning("Expiration %s not in any chain (SPX/SPXW)", expiration)
+            return []
+        chain_params, trading_class = chain_info
         exp_str = _format_expiration(expiration)
-        strikes = list(getattr(self._chain_params, "strikes", []) or [])
+        strikes = list(getattr(chain_params, "strikes", []) or [])
         if not strikes:
             return []
 
@@ -131,7 +168,7 @@ class IBKROptionsSupplier(OptionsChainSupplier):
                         strike,
                         right,
                         self._exchange,
-                        tradingClass=self._trading_class,
+                        tradingClass=trading_class,
                     )
                 )
         qualified = self._ib.qualifyContracts(*contracts)
@@ -165,5 +202,78 @@ class IBKROptionsSupplier(OptionsChainSupplier):
                     volume=vol,
                     open_interest=oi,
                 )
+            )
+        return out
+
+    def get_quotes_for_legs(self, legs: List[PositionLeg]) -> List[OptionQuote]:
+        """Request quotes only for the given legs (no full chain). One OptionQuote per leg, same order."""
+        self.connect()
+        if not legs:
+            return []
+        # Build one contract per leg (same order); skip leg if expiration not in chain
+        contracts: List[Any] = []
+        leg_indices: List[int] = []  # contracts[k] corresponds to legs[leg_indices[k]]
+        for i, leg in enumerate(legs):
+            chain_info = self._expiration_to_chain.get(leg.expiration)
+            if not chain_info:
+                continue
+            _chain_params, trading_class = chain_info
+            exp_str = _format_expiration(leg.expiration)
+            contracts.append(
+                Option(
+                    SPX_SYMBOL,
+                    exp_str,
+                    leg.strike,
+                    leg.right.upper(),
+                    self._exchange,
+                    tradingClass=trading_class,
+                )
+            )
+            leg_indices.append(i)
+        # Start with all legs as no-quote
+        out: List[OptionQuote] = [
+            OptionQuote(expiration=leg.expiration, strike=leg.strike, right=leg.right, bid=0.0, ask=0.0, last=0.0)
+            for leg in legs
+        ]
+        if not contracts:
+            return out
+        qualified = self._ib.qualifyContracts(*contracts)
+        if not qualified:
+            return out
+        log_ibkr_access("REQ_TICKERS", f"legs={len(qualified)} (active legs only)")
+        tickers = self._ib.reqTickers(*qualified)
+        # Allow time for all tickers to receive data (streaming)
+        util.sleep(0.5)
+        # Map each ticker to (exp, strike, right) so we assign to the correct leg regardless of order
+        ticker_by_key: Dict[Tuple[date, float, str], Any] = {}
+        for t in tickers:
+            c = t.contract
+            exp = _parse_expiration(c.lastTradeDateOrContractMonth)
+            key = (exp, _safe_float(c.strike), c.right.upper())
+            ticker_by_key[key] = t
+        for i, leg in enumerate(legs):
+            key = (leg.expiration, leg.strike, leg.right.upper())
+            t = ticker_by_key.get(key)
+            if t is None:
+                continue
+            c = t.contract
+            greeks = getattr(t, "modelGreeks", None) or getattr(t, "lastGreeks", None) or getattr(t, "bidGreeks", None) or getattr(t, "askGreeks", None)
+            delta_val = None
+            if greeks is not None:
+                d = getattr(greeks, "delta", None)
+                if d is not None and d != -1:
+                    delta_val = _safe_float(d)
+            out[i] = OptionQuote(
+                expiration=_parse_expiration(c.lastTradeDateOrContractMonth),
+                strike=_safe_float(c.strike),
+                right=c.right,
+                bid=_safe_float(t.bid),
+                ask=_safe_float(t.ask),
+                last=_safe_float(t.last),
+                volume=_safe_int(getattr(t, "volume", None)),
+                open_interest=_safe_int(
+                    getattr(t, "callOpenInterest", None) if c.right == "C" else getattr(t, "putOpenInterest", None)
+                ),
+                delta=delta_val,
             )
         return out
