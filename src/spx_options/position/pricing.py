@@ -6,18 +6,20 @@ from spx_options.position.leg import LegAction, PositionLeg
 
 
 def _leg_lazy_price(leg: PositionLeg, bid: float, ask: float) -> float:
-    """Price used for this leg in lazy bot: buy -> ask (debit), sell -> bid (credit)."""
+    """Price used for this leg in lazy bot: buy -> ask (debit), sell -> bid (credit); scaled by multiplier."""
+    mult = leg.multiplier
     if leg.action == LegAction.BUY:
-        return ask
-    return -bid  # credit is negative
+        return mult * ask
+    return -mult * bid  # credit is negative
 
 
 def _leg_smart_price(leg: PositionLeg, bid: float, ask: float) -> float:
-    """Price used for this leg in smart bot: mid; buy positive, sell negative."""
+    """Price used for this leg in smart bot: mid; buy positive, sell negative; scaled by multiplier."""
+    mult = leg.multiplier
     mid = (bid + ask) / 2.0 if (bid or ask) else 0.0
     if leg.action == LegAction.BUY:
-        return mid
-    return -mid
+        return mult * mid
+    return -mult * mid
 
 
 def lazy_bot_total(legs: List[Tuple[PositionLeg, float, float]]) -> float:
