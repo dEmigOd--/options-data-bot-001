@@ -8,8 +8,13 @@ from spx_options.position.leg import LegAction, PositionLeg
 from spx_options.suppliers.base import OptionQuote, OptionsChainSupplier
 
 
-def _leg(strike: float, right: str, action: LegAction) -> PositionLeg:
-    return PositionLeg(strike=strike, right=right, action=action)
+def _leg(
+    strike: float,
+    right: str,
+    action: LegAction,
+    expiration: date = date(2026, 3, 20),
+) -> PositionLeg:
+    return PositionLeg(expiration=expiration, strike=strike, right=right, action=action)
 
 
 def _quote(exp: date, strike: float, right: str, bid: float, ask: float) -> OptionQuote:
@@ -36,10 +41,10 @@ def test_get_leg_quotes_resolves_and_totals() -> None:
     supplier.get_chain.return_value = chain
 
     legs = [
-        _leg(4000.0, "C", LegAction.BUY),
-        _leg(4100.0, "C", LegAction.SELL),
+        _leg(4000.0, "C", LegAction.BUY, expiration=exp),
+        _leg(4100.0, "C", LegAction.SELL, expiration=exp),
     ]
-    resolved, lazy, smart = get_leg_quotes(supplier, exp, legs)
+    resolved, lazy, smart = get_leg_quotes(supplier, legs)
 
     assert len(resolved) == 2
     assert resolved[0] == (legs[0], 10.0, 11.0)
@@ -54,8 +59,8 @@ def test_get_leg_quotes_missing_quote_uses_zeros() -> None:
     supplier = MagicMock(spec=OptionsChainSupplier)
     supplier.get_chain.return_value = []
 
-    legs = [_leg(4000.0, "C", LegAction.BUY)]
-    resolved, lazy, smart = get_leg_quotes(supplier, exp, legs)
+    legs = [_leg(4000.0, "C", LegAction.BUY, expiration=exp)]
+    resolved, lazy, smart = get_leg_quotes(supplier, legs)
 
     assert resolved == [(legs[0], 0.0, 0.0)]
     assert lazy == 0.0

@@ -1,11 +1,27 @@
 """Unit tests for position pricing (lazy bot and smart bot)."""
 
+from datetime import date
+
 from spx_options.position.leg import LegAction, PositionLeg
 from spx_options.position.pricing import lazy_bot_total, smart_bot_total
 
+_DEFAULT_EXP = date(2026, 3, 20)
 
-def _leg(strike: float, right: str, action: LegAction) -> PositionLeg:
-    return PositionLeg(strike=strike, right=right, action=action)
+
+def _leg(
+    strike: float,
+    right: str,
+    action: LegAction,
+    multiplier: int = 1,
+    expiration: date = _DEFAULT_EXP,
+) -> PositionLeg:
+    return PositionLeg(
+        expiration=expiration,
+        strike=strike,
+        right=right,
+        action=action,
+        multiplier=multiplier,
+    )
 
 
 def test_lazy_bot_buy_uses_ask() -> None:
@@ -53,3 +69,17 @@ def test_smart_bot_multi_leg() -> None:
     ]
     # buy mid 11, sell mid -9 -> 2.0
     assert smart_bot_total(legs_with_quotes) == 2.0
+
+
+def test_lazy_bot_multiplier() -> None:
+    """Lazy: multiplier scales leg price (e.g. sell 2 at bid 5 -> credit 10)."""
+    leg = _leg(4100.0, "C", LegAction.SELL, multiplier=2)
+    total = lazy_bot_total([(leg, 5.0, 6.0)])
+    assert total == -10.0  # 2 * bid as credit
+
+
+def test_smart_bot_multiplier() -> None:
+    """Smart: multiplier scales mid (e.g. buy 3 at mid 10 -> 30)."""
+    leg = _leg(4000.0, "C", LegAction.BUY, multiplier=3)
+    total = smart_bot_total([(leg, 9.0, 11.0)])
+    assert total == 30.0  # 3 * 10
