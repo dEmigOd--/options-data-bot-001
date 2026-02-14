@@ -1,5 +1,6 @@
 """Interactive Brokers options chain supplier (read-only, with security logging)."""
 
+import asyncio
 import logging
 import math
 from datetime import date, datetime, timezone
@@ -86,6 +87,8 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         self._exchange = "SMART"
         # Map expiration date -> (chain_params, trading_class) for get_chain(exp)
         self._expiration_to_chain: Dict[date, Tuple[Any, str]] = {}
+        # Cache qualified Option by (expiration, strike, right) to avoid qualifyContracts every time
+        self._contract_cache: Dict[Tuple[date, float, str], Any] = {}
 
     def connect(self) -> None:
         """Connect to TWS/Gateway. Call before get_expirations/get_chain."""
@@ -139,6 +142,7 @@ class IBKROptionsSupplier(OptionsChainSupplier):
         if self._ib.isConnected():
             log_connection_close(self._host, self._port)
             self._ib.disconnect()
+            self._contract_cache.clear()
             log_ibkr_access("DISCONNECT", "")
 
     def __enter__(self) -> "IBKROptionsSupplier":
@@ -193,6 +197,10 @@ class IBKROptionsSupplier(OptionsChainSupplier):
             logger.warning("No contracts qualified for expiration %s", expiration)
             return []
 
+        for c in qualified:
+            exp_d = _parse_expiration(c.lastTradeDateOrContractMonth)
+            self._contract_cache[(exp_d, _safe_float(c.strike), c.right.upper())] = c
+
         log_ibkr_access("REQ_TICKERS", f"expiration={exp_str} count={len(qualified)}")
         tickers = self._ib.reqTickers(*qualified)
         for _ in range(15):
@@ -225,22 +233,22 @@ class IBKROptionsSupplier(OptionsChainSupplier):
             )
         return out
 
-    def get_quotes_for_legs(self, legs: List[PositionLeg]) -> List[OptionQuote]:
-        """Request quotes only for the given legs (no full chain). One OptionQuote per leg, same order."""
-        self.connect()
-        if not legs:
-            return []
-        # Build one contract per leg (same order); skip leg if expiration not in chain
+    def _get_or_qualify_contracts(self, legs: List[PositionLeg]) -> List[Any]:
+        """Return list of qualified contracts for the given legs. Use cache; qualify only misses in one batch."""
         contracts: List[Any] = []
-        leg_indices: List[int] = []  # contracts[k] corresponds to legs[leg_indices[k]]
-        for i, leg in enumerate(legs):
+        to_qualify: List[Any] = []
+        for leg in legs:
             chain_info = self._expiration_to_chain.get(leg.expiration)
             if not chain_info:
                 continue
-            _chain_params, trading_class = chain_info
-            exp_str = _format_expiration(leg.expiration)
-            contracts.append(
-                Option(
+            key = (leg.expiration, leg.strike, leg.right.upper())
+            cached = self._contract_cache.get(key)
+            if cached is not None:
+                contracts.append(cached)
+            else:
+                _chain_params, trading_class = chain_info
+                exp_str = _format_expiration(leg.expiration)
+                opt = Option(
                     SPX_SYMBOL,
                     exp_str,
                     leg.strike,
@@ -248,29 +256,42 @@ class IBKROptionsSupplier(OptionsChainSupplier):
                     self._exchange,
                     tradingClass=trading_class,
                 )
-            )
-            leg_indices.append(i)
-        # Start with all legs as no-quote
+                to_qualify.append(opt)
+        if to_qualify:
+            qualified = self._ib.qualifyContracts(*to_qualify)
+            for q in qualified:
+                exp_d = _parse_expiration(q.lastTradeDateOrContractMonth)
+                self._contract_cache[(exp_d, _safe_float(q.strike), q.right.upper())] = q
+            contracts.extend(qualified)
+        return contracts
+
+    async def _req_tickers_with_gather(self, contracts: List[Any], timeout: float = 2.0) -> List[Any]:
+        """Request tickers for all contracts at once; wait for all updates in parallel with asyncio.gather."""
+        if not contracts:
+            return []
+        tickers = await self._ib.reqTickersAsync(*contracts)
+        async def wait_one(t):
+            try:
+                await asyncio.wait_for(t.updateEvent, timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+        await asyncio.gather(*[wait_one(t) for t in tickers])
+        return tickers
+
+    def get_quotes_for_legs(self, legs: List[PositionLeg]) -> List[OptionQuote]:
+        """Request quotes only for the given legs. Uses cached contracts; reqTickers once; wait with asyncio.gather."""
+        self.connect()
+        if not legs:
+            return []
+        contracts = self._get_or_qualify_contracts(legs)
         out: List[OptionQuote] = [
             OptionQuote(expiration=leg.expiration, strike=leg.strike, right=leg.right, bid=0.0, ask=0.0, last=0.0)
             for leg in legs
         ]
         if not contracts:
             return out
-        qualified = self._ib.qualifyContracts(*contracts)
-        if not qualified:
-            return out
-        log_ibkr_access("REQ_TICKERS", f"legs={len(qualified)} (active legs only)")
-        tickers = self._ib.reqTickers(*qualified)
-        # Run event loop until all tickers have data or 2s max (so every leg gets bid/ask)
-        for _ in range(20):
-            self._ib.sleep(0.1)
-            if all(
-                _safe_float(t.bid) != 0 or _safe_float(t.ask) != 0 or _safe_float(t.last) != 0
-                for t in tickers
-            ):
-                break
-        # Map each ticker to (exp, strike, right) so we assign to the correct leg regardless of order
+        log_ibkr_access("REQ_TICKERS", f"legs={len(contracts)} (cached/qualified)")
+        tickers = self._ib.run(self._req_tickers_with_gather(contracts))
         ticker_by_key: Dict[Tuple[date, float, str], Any] = {}
         for t in tickers:
             c = t.contract
